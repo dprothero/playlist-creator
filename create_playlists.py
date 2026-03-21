@@ -1,27 +1,34 @@
 """
 YouTube Music Playlist Creator — Aftershock 2026
 
-SETUP (one-time):
-    pip install -r requirements.txt
-    python -c "from ytmusicapi import setup_oauth; setup_oauth(filepath='oauth.json')"
+Uses the official YouTube Data API v3 with OAuth2 credentials.
 
-    This opens a browser URL. Log in with your Google account and the token is
-    saved to oauth.json. Do NOT commit oauth.json to version control.
+SETUP (one-time):
+    ./setup-auth.sh
 
 USAGE:
     python create_playlists.py              # create both playlists
     python create_playlists.py --dry-run    # preview without creating anything
     python create_playlists.py --verbose    # show debug-level logging
     python create_playlists.py --oauth-file path/to/oauth.json
+
+State is saved to progress.json after each step so the script can resume
+where it left off if interrupted (e.g. by quota limits). Search results are
+cached in search_cache.json to avoid burning quota on repeated runs.
 """
 
 import argparse
+import json
 import logging
 import os
 import sys
 import time
 
-from ytmusicapi import YTMusic
+import requests
+
+API_BASE = "https://www.googleapis.com/youtube/v3"
+SEARCH_CACHE_FILE = "search_cache.json"
+PROGRESS_FILE = "progress.json"
 
 # ---------------------------------------------------------------------------
 # Playlist data
@@ -134,111 +141,263 @@ PLAYLISTS = [
 ]
 
 # ---------------------------------------------------------------------------
-# Authentication
+# Search cache
 # ---------------------------------------------------------------------------
 
-def get_authenticated_client(oauth_file: str = "oauth.json") -> YTMusic:
+def load_search_cache() -> dict[str, str | None]:
+    if os.path.exists(SEARCH_CACHE_FILE):
+        with open(SEARCH_CACHE_FILE) as f:
+            return json.load(f)
+    return {}
+
+
+def save_search_cache(cache: dict[str, str | None]) -> None:
+    with open(SEARCH_CACHE_FILE, "w") as f:
+        json.dump(cache, f, indent=2)
+
+
+def cache_key(artist: str, title: str) -> str:
+    return f"{artist} — {title}"
+
+# ---------------------------------------------------------------------------
+# Progress tracking
+# ---------------------------------------------------------------------------
+
+def load_progress() -> dict:
+    """Load progress state.
+
+    Structure:
+    {
+        "playlists": {
+            "<playlist_name>": {
+                "playlist_id": "...",
+                "added_songs": ["artist — title", ...]
+            }
+        }
+    }
+    """
+    if os.path.exists(PROGRESS_FILE):
+        with open(PROGRESS_FILE) as f:
+            return json.load(f)
+    return {"playlists": {}}
+
+
+def save_progress(progress: dict) -> None:
+    with open(PROGRESS_FILE, "w") as f:
+        json.dump(progress, f, indent=2)
+
+# ---------------------------------------------------------------------------
+# OAuth token management
+# ---------------------------------------------------------------------------
+
+def load_token(oauth_file: str, client_id: str, client_secret: str) -> str:
+    """Load access token from oauth.json, refreshing if expired."""
     if not os.path.exists(oauth_file):
         sys.exit(
-            f"ERROR: OAuth credentials not found at '{oauth_file}'.\n\n"
-            "Run the one-time setup:\n"
-            "  python -c \"from ytmusicapi import setup_oauth; "
-            "setup_oauth(filepath='oauth.json')\"\n\n"
-            "Then re-run this script."
+            f"ERROR: OAuth credentials not found at '{oauth_file}'.\n"
+            "Run ./setup-auth.sh first."
         )
-    return YTMusic(oauth_file)
+
+    with open(oauth_file) as f:
+        token_data = json.load(f)
+
+    # Refresh if expired or expiring within 60s
+    if token_data.get("expires_at", 0) - time.time() < 60:
+        logging.info("Access token expired, refreshing...")
+        resp = requests.post("https://oauth2.googleapis.com/token", data={
+            "client_id": client_id,
+            "client_secret": client_secret,
+            "refresh_token": token_data["refresh_token"],
+            "grant_type": "refresh_token",
+        })
+        resp.raise_for_status()
+        fresh = resp.json()
+        token_data["access_token"] = fresh["access_token"]
+        token_data["expires_at"] = int(time.time()) + fresh["expires_in"]
+        token_data["expires_in"] = fresh["expires_in"]
+        with open(oauth_file, "w") as f:
+            json.dump(token_data, f, indent=True)
+        logging.info("Token refreshed successfully.")
+
+    return token_data["access_token"]
+
+
+def auth_headers(access_token: str) -> dict:
+    return {"Authorization": f"Bearer {access_token}"}
 
 # ---------------------------------------------------------------------------
-# Core operations
+# YouTube Data API v3 operations
 # ---------------------------------------------------------------------------
 
-def search_song(ytm: YTMusic, artist: str, title: str) -> str | None:
+def search_song(access_token: str, artist: str, title: str, search_cache: dict) -> str | None:
+    key = cache_key(artist, title)
+    if key in search_cache:
+        video_id = search_cache[key]
+        if video_id:
+            logging.debug("Cache hit: %s -> %s", key, video_id)
+        else:
+            logging.debug("Cache hit (not found): %s", key)
+        return video_id
+
     query = f"{artist} {title}"
     logging.debug("Searching: %s", query)
-    try:
-        results = ytm.search(query, filter="songs", limit=5)
-    except Exception as exc:
-        logging.warning("Search error for '%s': %s", query, exc)
+    resp = requests.get(f"{API_BASE}/search", params={
+        "part": "snippet",
+        "q": query,
+        "type": "video",
+        "videoCategoryId": "10",  # Music
+        "maxResults": 5,
+    }, headers=auth_headers(access_token))
+
+    if resp.status_code == 403:
+        logging.error("Quota exceeded during search for '%s'. Re-run later to resume.", query)
+        save_search_cache(search_cache)
+        sys.exit(2)
+
+    if resp.status_code != 200:
+        logging.warning("Search error for '%s': %s %s", query, resp.status_code, resp.text[:200])
         return None
 
-    if not results:
+    items = resp.json().get("items", [])
+    if not items:
         logging.warning("Not found: %s — %s", artist, title)
+        search_cache[key] = None
+        save_search_cache(search_cache)
         return None
 
-    video_id = results[0].get("videoId")
-    if not video_id:
-        logging.warning("No videoId in result for: %s — %s", artist, title)
-        return None
-
-    logging.debug("Found: %s (videoId=%s)", results[0].get("title", "?"), video_id)
+    video_id = items[0]["id"]["videoId"]
+    logging.debug("Found: %s (videoId=%s)", items[0]["snippet"]["title"], video_id)
+    search_cache[key] = video_id
+    save_search_cache(search_cache)
     return video_id
 
 
-def create_playlist(ytm: YTMusic, name: str, description: str, dry_run: bool = False) -> str | None:
+def create_playlist(access_token: str, name: str, description: str, dry_run: bool = False) -> str | None:
     if dry_run:
         logging.info("[DRY RUN] Would create playlist: %s", name)
         return "DRY_RUN_PLAYLIST_ID"
-    try:
-        playlist_id = ytm.create_playlist(name, description)
-        logging.info("Created playlist '%s' (id=%s)", name, playlist_id)
-        return playlist_id
-    except Exception as exc:
-        logging.error("Failed to create playlist '%s': %s", name, exc)
+
+    resp = requests.post(f"{API_BASE}/playlists", params={"part": "snippet,status"}, json={
+        "snippet": {"title": name, "description": description},
+        "status": {"privacyStatus": "private"},
+    }, headers=auth_headers(access_token))
+
+    if resp.status_code == 403:
+        logging.error("Quota exceeded creating playlist '%s'. Re-run later to resume.", name)
+        sys.exit(2)
+
+    if resp.status_code != 200:
+        logging.error("Failed to create playlist '%s': %s %s", name, resp.status_code, resp.text[:300])
         return None
 
+    playlist_id = resp.json()["id"]
+    logging.info("Created playlist '%s' (id=%s)", name, playlist_id)
+    return playlist_id
 
-def add_songs_to_playlist(
-    ytm: YTMusic, playlist_id: str, video_ids: list[str], dry_run: bool = False
-) -> bool:
-    if not video_ids:
-        return True
-    if dry_run:
-        logging.info("[DRY RUN] Would add %d songs to playlist %s", len(video_ids), playlist_id)
-        return True
-    try:
-        ytm.add_playlist_items(playlist_id, video_ids)
-        logging.info("Added %d songs to playlist %s", len(video_ids), playlist_id)
-        return True
-    except Exception as exc:
-        logging.error("Failed to add songs to playlist %s: %s", playlist_id, exc)
+
+def add_song_to_playlist(access_token: str, playlist_id: str, video_id: str) -> bool:
+    resp = requests.post(f"{API_BASE}/playlistItems", params={"part": "snippet"}, json={
+        "snippet": {
+            "playlistId": playlist_id,
+            "resourceId": {"kind": "youtube#video", "videoId": video_id},
+        },
+    }, headers=auth_headers(access_token))
+
+    if resp.status_code == 403:
+        logging.error("Quota exceeded adding video %s. Re-run later to resume.", video_id)
         return False
+
+    if resp.status_code != 200:
+        logging.warning("Failed to add video %s to playlist %s: %s", video_id, playlist_id, resp.text[:200])
+        return False
+    return True
 
 # ---------------------------------------------------------------------------
 # Orchestration
 # ---------------------------------------------------------------------------
 
 def build_playlist(
-    ytm: YTMusic, playlist_def: dict, dry_run: bool = False
+    access_token: str,
+    playlist_def: dict,
+    search_cache: dict,
+    progress: dict,
+    dry_run: bool = False,
 ) -> dict:
     name = playlist_def["name"]
     description = playlist_def["description"]
     songs = playlist_def["songs"]
+    pl_progress = progress["playlists"].get(name, {})
+
+    # Skip fully completed playlists
+    if pl_progress.get("complete"):
+        logging.info("--- Skipping completed playlist: %s ---", name)
+        return {
+            "name": name,
+            "playlist_id": pl_progress.get("playlist_id"),
+            "added": len(pl_progress.get("added_songs", [])),
+            "skipped": [],
+            "status": "already complete",
+        }
 
     logging.info("--- Building playlist: %s (%d songs) ---", name, len(songs))
 
-    playlist_id = create_playlist(ytm, name, description, dry_run)
-    if playlist_id is None:
-        return {"name": name, "playlist_id": None, "added": 0, "skipped": songs}
+    # Resume: reuse existing playlist_id if we already created it
+    playlist_id = pl_progress.get("playlist_id")
+    if playlist_id:
+        logging.info("Resuming playlist '%s' (id=%s)", name, playlist_id)
+    else:
+        playlist_id = create_playlist(access_token, name, description, dry_run)
+        if playlist_id is None:
+            return {"name": name, "playlist_id": None, "added": 0, "skipped": songs}
+        pl_progress["playlist_id"] = playlist_id
+        pl_progress.setdefault("added_songs", [])
+        progress["playlists"][name] = pl_progress
+        save_progress(progress)
 
-    video_ids = []
+    added_songs = set(pl_progress.get("added_songs", []))
+    added_count = len(added_songs)
     skipped = []
+    quota_hit = False
 
     for song in songs:
         artist = song["artist"]
         title = song["title"]
-        video_id = search_song(ytm, artist, title)
+        song_key = cache_key(artist, title)
+
+        # Skip songs already added to this playlist
+        if song_key in added_songs:
+            logging.debug("Already added: %s", song_key)
+            continue
+
+        video_id = search_song(access_token, artist, title, search_cache)
         if video_id:
-            video_ids.append(video_id)
+            if dry_run:
+                added_count += 1
+            else:
+                if add_song_to_playlist(access_token, playlist_id, video_id):
+                    added_count += 1
+                    pl_progress.setdefault("added_songs", []).append(song_key)
+                    save_progress(progress)
+                else:
+                    # Likely quota exceeded — stop and save
+                    logging.warning("Stopping playlist '%s' — will resume on next run.", name)
+                    quota_hit = True
+                    break
         else:
             skipped.append(song)
         time.sleep(0.2)  # gentle rate limiting
 
-    add_songs_to_playlist(ytm, playlist_id, video_ids, dry_run)
+    if not quota_hit and not dry_run:
+        pl_progress["complete"] = True
+        save_progress(progress)
+
+    if dry_run:
+        logging.info("[DRY RUN] Would add %d songs to playlist %s", added_count, playlist_id)
 
     return {
         "name": name,
         "playlist_id": playlist_id,
-        "added": len(video_ids),
+        "added": added_count,
         "skipped": skipped,
     }
 
@@ -249,6 +408,8 @@ def print_summary(results: list[dict]) -> None:
     print("=" * 50)
     for r in results:
         print(f"\n{r['name']}")
+        if r.get("status"):
+            print(f"  STATUS  : {r['status']}")
         if r["playlist_id"] is None:
             print("  STATUS  : FAILED (playlist not created)")
         else:
@@ -287,6 +448,21 @@ def main() -> None:
         metavar="FILE",
         help="Path to OAuth credentials file (default: oauth.json).",
     )
+    parser.add_argument(
+        "--client-id",
+        default=os.environ.get("YTM_CLIENT_ID"),
+        help="OAuth client ID (or set YTM_CLIENT_ID env var).",
+    )
+    parser.add_argument(
+        "--client-secret",
+        default=os.environ.get("YTM_CLIENT_SECRET"),
+        help="OAuth client secret (or set YTM_CLIENT_SECRET env var).",
+    )
+    parser.add_argument(
+        "--reset",
+        action="store_true",
+        help="Clear progress and search cache, start fresh.",
+    )
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -295,11 +471,25 @@ def main() -> None:
         datefmt="%H:%M:%S",
     )
 
-    ytm = get_authenticated_client(args.oauth_file)
+    if args.reset:
+        for f in [PROGRESS_FILE, SEARCH_CACHE_FILE]:
+            if os.path.exists(f):
+                os.remove(f)
+                logging.info("Removed %s", f)
+
+    if not args.client_id or not args.client_secret:
+        sys.exit(
+            "ERROR: client_id and client_secret are required.\n"
+            "Set YTM_CLIENT_ID and YTM_CLIENT_SECRET env vars, or pass --client-id and --client-secret."
+        )
+
+    access_token = load_token(args.oauth_file, args.client_id, args.client_secret)
+    search_cache = load_search_cache()
+    progress = load_progress()
 
     results = []
     for playlist_def in PLAYLISTS:
-        result = build_playlist(ytm, playlist_def, dry_run=args.dry_run)
+        result = build_playlist(access_token, playlist_def, search_cache, progress, dry_run=args.dry_run)
         results.append(result)
 
     print_summary(results)

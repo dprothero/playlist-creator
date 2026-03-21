@@ -1,3 +1,5 @@
 oauth.json
+progress.json
+search_cache.json
 __pycache__/
 *.pyc
